@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    constexpr size_t chunk_size = 100;
+    constexpr size_t chunk_size = 300;
     
     for (int i = 0; i < upcxx::rank_n(); i++) {
         const auto& batch = inserts[i];
@@ -111,7 +111,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    upcxx::when_all(insert_futures.begin(), insert_futures.end()).wait();
+    for (auto& fut : insert_futures) {
+        fut.wait();
+    }
     auto end_insert = std::chrono::high_resolution_clock::now();
     upcxx::barrier();
 
@@ -167,14 +169,14 @@ int main(int argc, char** argv) {
     while (!ongoing_contigs.empty()) {
         std::vector<std::vector<pkmer_t>> finds(upcxx::rank_n());
         std::vector<std::vector<std::list<std::list<kmer_pair>>::iterator>> contig_iters(upcxx::rank_n());
-        std::vector<std::vector<upcxx::future<std::vector<std::optional<kmer_pair>>>>> find_futures(upcxx::rank_n());
+        std::vector<std::vector<upcxx::future<std::vector<std::optional<Ext>>>>> find_futures(upcxx::rank_n());
     
         // Step 1: Build queries from last kmer of each ongoing contig
         // std::cerr << upcxx::rank_me() << ": [DEBUG] Building queries from last kmer of each ongoing contig\n";
         for (auto it = ongoing_contigs.begin(); it != ongoing_contigs.end(); ++it) {
-            kmer_pair& tail = it->back();
-            int rank = hashmap.get_target_rank(tail.next_kmer());
-            finds[rank].push_back(tail.next_kmer());
+            pkmer_t tail = it->back().next_kmer();
+            int rank = hashmap.get_target_rank(tail);
+            finds[rank].push_back(tail);
             contig_iters[rank].push_back(it); // keep track of which contig each query belongs to
         }
     
@@ -195,34 +197,28 @@ int main(int argc, char** argv) {
     
         // Step 3: Wait for all results
         // std::cerr << upcxx::rank_me() << ": [DEBUG] Finished waiting for all results\n";
-        std::vector<std::vector<std::optional<kmer_pair>>> results_batches;
         for (int rank = 0; rank < upcxx::rank_n(); ++rank) {
-            std::vector<std::optional<kmer_pair>> results;
+            int bias = 0;
             for (const auto& fut : find_futures[rank]) {
                 const auto& result = fut.wait();
-                results.insert(results.end(), result.begin(), result.end());
-            }
-            results_batches.push_back(results);
-        }
-    
-        // Step 4: Process results and update contigs
-        // std::cerr << upcxx::rank_me() << ": [DEBUG] Processing results and updating contigs\n";
-        for (int rank = 0; rank < upcxx::rank_n(); ++rank) {
-            for (size_t i = 0; i < results_batches[rank].size(); ++i) {
-                const auto& opt_kmer = results_batches[rank][i];
-                auto contig_it = contig_iters[rank][i];
-        
-                if (opt_kmer.has_value()) {
-                    contig_it->push_back(opt_kmer.value());
-                    // std::cerr << upcxx::rank_me() << ": [DEBUG] Completed contig." << std::endl;
-                    if (opt_kmer.value().forwardExt() == 'F') {
-                        // std::cerr << upcxx::rank_me() << ": [DEBUG] Completed contig." << std::endl;
-                        contigs.push_back(std::move(*contig_it));
-                        ongoing_contigs.erase(contig_it);
+                for (size_t i = 0; i < result.size(); ++i) {
+                    const auto& opt_fb_ext = result[i];
+                    auto contig_it = contig_iters[rank][i + bias];
+                    if (opt_fb_ext.has_value()) {
+                        kmer_pair kmer;
+                        kmer.kmer = finds[rank][i + bias];
+                        kmer.fb_ext[0] = opt_fb_ext.value().backwardExt;
+                        kmer.fb_ext[1] = opt_fb_ext.value().forwardExt;
+                        contig_it->push_back(kmer);
+                        if (kmer.forwardExt() == 'F') {
+                            contigs.push_back(std::move(*contig_it));
+                            ongoing_contigs.erase(contig_it);
+                        }
+                    } else {
+                        throw std::runtime_error("Error: k-mer not found in hashmap.");
                     }
-                } else {
-                    throw std::runtime_error("Error: k-mer not found in hashmap.");
                 }
+                bias += result.size();
             }
         }
     }

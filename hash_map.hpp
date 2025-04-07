@@ -81,6 +81,11 @@
 #include <vector>
 #include <optional>
 
+struct Ext {
+    char backwardExt;
+    char forwardExt;
+};
+
 struct HashMap {
     // Each rank holds a local linear-probing-based hash table
     upcxx::dist_object<std::vector<std::optional<kmer_pair>>> table;
@@ -94,7 +99,7 @@ struct HashMap {
     upcxx::future<bool> insert(const kmer_pair& kmer);
     upcxx::future<bool> insert(const std::vector<kmer_pair>& kmers);
     upcxx::future<std::optional<kmer_pair>> find(const pkmer_t& key_kmer);
-    upcxx::future<std::vector<std::optional<kmer_pair>>> find(const std::vector<pkmer_t>& key_kmers);
+    upcxx::future<std::vector<std::optional<Ext>>> find(const std::vector<pkmer_t>& key_kmers);
 
     int get_target_rank(const pkmer_t& key_kmer) const;
     size_t get_bucket_index(const pkmer_t& key_kmer) const;
@@ -195,23 +200,23 @@ upcxx::future<std::optional<kmer_pair>> HashMap::find(const pkmer_t& key_kmer) {
                       }, table, bucket_count, key_kmer);
 }
 
-upcxx::future<std::vector<std::optional<kmer_pair>>> HashMap::find(const std::vector<pkmer_t>& key_kmers) {
+upcxx::future<std::vector<std::optional<Ext>>> HashMap::find(const std::vector<pkmer_t>& key_kmers) {
     if (key_kmers.empty()) {
-        return upcxx::make_future(std::vector<std::optional<kmer_pair>>{});
+        return upcxx::make_future(std::vector<std::optional<Ext>>{});
     }
 
     int target_rank = get_target_rank(key_kmers[0]); // assumes all keys go to same rank
     return upcxx::rpc(target_rank,
                       [](upcxx::dist_object<std::vector<std::optional<kmer_pair>>>& table,
                          size_t bucket_count,
-                         const std::vector<pkmer_t>& key_kmers) -> std::vector<std::optional<kmer_pair>> {
+                         const std::vector<pkmer_t>& key_kmers) -> std::vector<std::optional<Ext>> {
                           const auto& local_table = *table;
-                          std::vector<std::optional<kmer_pair>> results;
+                          std::vector<std::optional<Ext>> results;
                           results.reserve(key_kmers.size());
 
                           for (const auto& key : key_kmers) {
                               size_t idx = key.hash() % bucket_count;
-                              std::optional<kmer_pair> result = std::nullopt;
+                              std::optional<Ext> result = std::nullopt;
 
                               for (size_t i = 0; i < bucket_count; ++i) {
                                   size_t probe_idx = (idx + i) % bucket_count;
@@ -220,7 +225,7 @@ upcxx::future<std::vector<std::optional<kmer_pair>>> HashMap::find(const std::ve
                                   if (!slot.has_value()) {
                                       break;
                                   } else if (slot->kmer == key) {
-                                      result = slot;
+                                      result = Ext{slot->fb_ext[0], slot->fb_ext[1]};
                                       break;
                                   }
                               }
